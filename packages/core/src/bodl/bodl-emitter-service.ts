@@ -1,10 +1,17 @@
-import { AnalyticStepOrder, AnalyticStepType } from './analytics-steps';
-import { LineItemMap } from '../cart';
+import { flatten } from 'lodash';
+
+import { LineItem, LineItemMap } from '../cart';
 import { CheckoutSelectors, CheckoutStoreSelector } from '../checkout';
 import { MissingDataError, MissingDataErrorType } from '../common/error/errors';
 
-import BodlService from "./bodl-service";
-import { BodlEventsCheckout, BodlEventsPayload, BODLProduct } from './bodl-window';
+import { AnalyticStepOrder, AnalyticStepType } from './analytics-steps';
+import BodlService from './bodl-service';
+import {
+    BodlEventsCheckout,
+    BodlEventsPayload,
+    BODLProduct,
+    CommonCheckoutData,
+} from './bodl-window';
 
 export default class BodlEmitterService implements BodlService {
     private _checkoutStarted = false;
@@ -15,9 +22,9 @@ export default class BodlEmitterService implements BodlService {
 
     constructor(
         private subscribe: (subscriber: (state: CheckoutSelectors) => void) => void,
-        private bodlEvents: BodlEventsCheckout
+        private bodlEvents: BodlEventsCheckout,
     ) {
-        this.subscribe(state => {
+        this.subscribe((state) => {
             this.setState(state.data);
 
             const config = this.state?.getConfig();
@@ -33,35 +40,13 @@ export default class BodlEmitterService implements BodlService {
     }
 
     checkoutBegin(): void {
-        if (this._checkoutStarted) {
+        const data = this._getCommonCheckoutData();
+
+        if (this._checkoutStarted || !data) {
             return;
         }
 
-        const checkout = this.state?.getCheckout();
-
-        if (!checkout) {
-            return;
-        }
-
-        const {
-            cart: {
-                cartAmount,
-                currency,
-                lineItems,
-                id,
-                coupons,
-            },
-            channelId,
-        } = checkout;
-
-        this.bodlEvents.emitCheckoutBeginEvent({
-            id,
-            currency: currency.code,
-            cart_value: cartAmount,
-            coupon: coupons.map(coupon => coupon.code.toUpperCase()).join(','),
-            line_items: this._getProducts(lineItems, currency.code),
-            channel_id: channelId
-        });
+        this.bodlEvents.emitCheckoutBeginEvent(data);
 
         this._checkoutStarted = true;
     }
@@ -91,13 +76,13 @@ export default class BodlEmitterService implements BodlService {
         }
 
         this.bodlEvents.emitOrderPurchasedEvent({
-            id: cartId,
+            event_id: cartId,
             currency: currency.code,
-            transaction_id: orderId,
+            order_id: orderId,
             tax: taxTotal,
             channel_id: channelId,
             cart_value: orderAmount,
-            coupon: coupons.map(coupon => coupon.code.toUpperCase()).join(','),
+            coupon_codes: coupons.map((coupon) => coupon.code.toUpperCase()),
             shipping_cost: shippingCostTotal,
             line_items: this._getProducts(lineItems, currency.code),
         });
@@ -126,6 +111,10 @@ export default class BodlEmitterService implements BodlService {
         this.bodlEvents.emit('bodl_checkout_email_entry_began');
     }
 
+    customerSuggestionInit(payload?: BodlEventsPayload) {
+        this.bodlEvents.emit('bodl_checkout_customer_suggestion_initialization', payload);
+    }
+
     customerSuggestionExecute() {
         this.bodlEvents.emit('bodl_checkout_customer_suggestion_execute');
     }
@@ -144,7 +133,16 @@ export default class BodlEmitterService implements BodlService {
     }
 
     selectedPaymentMethod(paymentOption?: string) {
-        this.bodlEvents.emit('bodl_checkout_payment_method_selected', { paymentOption });
+        const commonData = this._getCommonCheckoutData();
+
+        if (!commonData || !paymentOption) {
+            return;
+        }
+
+        this.bodlEvents.emitPaymentDetailsProvidedEvent({
+            ...commonData,
+            payment_type: paymentOption,
+        });
     }
 
     clickPayButton(payload?: BodlEventsPayload) {
@@ -163,8 +161,59 @@ export default class BodlEmitterService implements BodlService {
         this.bodlEvents.emit('bodl_checkout_exit');
     }
 
+    private _trackCompletedStep(step: AnalyticStepType) {
+        this._completedSteps[step] = true;
+
+        const bodlEventsMap: { [key in AnalyticStepType]?: () => void } = {
+            [AnalyticStepType.SHIPPING]: this._trackShippingStepCompleted.bind(this),
+        };
+        const emit = bodlEventsMap[step];
+
+        if (emit) {
+            emit();
+        } else {
+            this.bodlEvents.emit('bodl_checkout_step_completed', { step });
+        }
+    }
+
+    private _trackShippingStepCompleted(): void {
+        const shippingMethod = this.state?.getSelectedShippingOption()?.description;
+        const commonData = this._getCommonCheckoutData();
+
+        if (!commonData || !shippingMethod) {
+            return;
+        }
+
+        this.bodlEvents.emitShippingDetailsProvidedEvent({
+            ...commonData,
+            shipping_method: shippingMethod,
+        });
+    }
+
+    private _getCommonCheckoutData(): CommonCheckoutData | null {
+        const checkout = this.state?.getCheckout();
+
+        if (!checkout) {
+            return null;
+        }
+
+        const {
+            cart: { cartAmount, currency, lineItems, id, coupons },
+            channelId,
+        } = checkout;
+
+        return {
+            event_id: id,
+            currency: currency.code,
+            cart_value: cartAmount,
+            coupon_codes: coupons.map((coupon) => coupon.code.toUpperCase()),
+            line_items: this._getProducts(lineItems, currency.code),
+            channel_id: channelId,
+        };
+    }
+
     private _getProducts(lineItems: LineItemMap, currencyCode: string): BODLProduct[] {
-        const customItems: BODLProduct[] = (lineItems.customItems || []).map(item => ({
+        const customItems: BODLProduct[] = (lineItems.customItems || []).map((item) => ({
             product_id: item.id,
             sku: item.sku,
             base_price: item.listPrice,
@@ -175,7 +224,7 @@ export default class BodlEmitterService implements BodlService {
             currency: currencyCode,
         }));
 
-        const giftCertificateItems: BODLProduct[] = lineItems.giftCertificates.map(item => {
+        const giftCertificateItems: BODLProduct[] = lineItems.giftCertificates.map((item) => {
             return {
                 product_id: item.id,
                 gift_certificate_id: item.id,
@@ -193,11 +242,21 @@ export default class BodlEmitterService implements BodlService {
         const physicalAndDigitalItems: BODLProduct[] = [
             ...lineItems.physicalItems,
             ...lineItems.digitalItems,
-        ].map(item => {
+        ].map((item) => {
+            const getCategoryNames = (lineItem: LineItem): string[] => {
+                if (Array.isArray(lineItem.categoryNames)) {
+                    return lineItem.categoryNames;
+                } else if (Array.isArray(lineItem.categories)) {
+                    return flatten(lineItem.categories).map(({ name }) => name);
+                }
+
+                return [];
+            };
+
             let itemAttributes;
 
             if (item.options && item.options.length) {
-                itemAttributes = item.options.map(option => `${option.name}:${option.value}`);
+                itemAttributes = item.options.map((option) => `${option.name}:${option.value}`);
                 itemAttributes.sort();
             }
 
@@ -213,24 +272,20 @@ export default class BodlEmitterService implements BodlService {
                 discount: item.discountAmount,
                 brand_name: item.brand,
                 currency: currencyCode,
-                category_name: item.categoryNames ? item.categoryNames.join(', ') : '',
+                category_names: getCategoryNames(item),
+                retail_price: item.retailPrice,
             };
         });
 
-        return [
-            ...customItems,
-            ...physicalAndDigitalItems,
-            ...giftCertificateItems,
-        ];
-    }
-
-    private _trackCompletedStep(step: AnalyticStepType) {
-        this._completedSteps[step] = true;
-        this.bodlEvents.emit('bodl_checkout_step_completed', { step });
+        return [...customItems, ...physicalAndDigitalItems, ...giftCertificateItems].map(
+            (item) => ({
+                ...item,
+                product_id: String(item.product_id),
+            }),
+        );
     }
 
     private _hasStepCompleted(step: AnalyticStepType): boolean {
         return this._completedSteps[step];
     }
 }
-
